@@ -1,6 +1,9 @@
 package pdu
 
 import (
+	"bytes"
+	"encoding/binary"
+	"log/slog"
 	"net"
 	"testing"
 )
@@ -289,5 +292,59 @@ func TestMockConn_RemoteAddr(t *testing.T) {
 	addr := mockConn.RemoteAddr()
 	if addr.String() != "10.0.0.1:11112" {
 		t.Errorf("RemoteAddr().String() = %s, want 10.0.0.1:11112", addr.String())
+	}
+}
+
+// TestCreateAssociateAccept_WireFormat verifies the A-ASSOCIATE-AC PDU matches
+// DICOM PS3.8: the Result/Reason byte sits at sub-field offset 2 (not 1) of the
+// presentation context item, and the announced Maximum Length reflects the
+// negotiated value rather than a hardcoded constant.
+func TestCreateAssociateAccept_WireFormat(t *testing.T) {
+	p := &Layer{
+		logger: slog.Default(),
+		associationCtx: &AssociationContext{
+			CalledAETitle:  "SCP",
+			CallingAETitle: "SCU",
+			MaxPDULength:   8192,
+			PresentationCtxs: map[byte]*PresentationContext{
+				1: {ID: 1, Result: presentationResultAcceptance, AbstractSyntax: "1.2.840.10008.5.1.4.1.1.2", TransferSyntax: "1.2.840.10008.1.2.1"},
+			},
+		},
+	}
+
+	ac := p.createAssociateAccept()
+
+	// Locate the 0x21 presentation context item within the variable-items region.
+	data := ac[6:] // strip PDU header
+	idx := -1
+	for off := 68; off+4 <= len(data); {
+		itemLen := int(binary.BigEndian.Uint16(data[off+2 : off+4]))
+		if data[off] == 0x21 {
+			idx = off
+			break
+		}
+		off += 4 + itemLen
+	}
+	if idx == -1 {
+		t.Fatal("no 0x21 presentation context item in A-ASSOCIATE-AC")
+	}
+
+	if data[idx+4] != 1 {
+		t.Errorf("context ID = %d, want 1", data[idx+4])
+	}
+	if data[idx+5] != 0x00 {
+		t.Errorf("byte after context ID = 0x%02x, want 0x00 (reserved)", data[idx+5])
+	}
+	if data[idx+6] != presentationResultAcceptance {
+		t.Errorf("Result/Reason byte = 0x%02x at offset+6, want 0x00", data[idx+6])
+	}
+
+	// Maximum Length sub-item (0x51) must announce 8192.
+	mlIdx := bytes.Index(data, []byte{0x51, 0x00, 0x00, 0x04})
+	if mlIdx == -1 {
+		t.Fatal("no 0x51 Maximum Length sub-item")
+	}
+	if got := binary.BigEndian.Uint32(data[mlIdx+4 : mlIdx+8]); got != 8192 {
+		t.Errorf("announced Maximum Length = %d, want 8192", got)
 	}
 }

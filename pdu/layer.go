@@ -191,7 +191,10 @@ func parsePresentationContext(data []byte, logger *slog.Logger) (*PresentationCo
 	}, nil
 }
 
-func parseUserInformation(data []byte) (uint32, error) {
+// ParseUserInformation parses a User Information item body (the bytes after the
+// 4-byte item header) and returns the peer's announced Maximum PDU Length from
+// the 0x51 sub-item, or 0 if none was present.
+func ParseUserInformation(data []byte) (uint32, error) {
 	offset := 0
 	var maxPDULength uint32
 
@@ -570,7 +573,8 @@ func (p *Layer) createAssociateAccept() []byte {
 		presContextLen := make([]byte, 2)
 		binary.BigEndian.PutUint16(presContextLen, uint16(4+len(presContextData)))
 		presContextItem = append(presContextItem, presContextLen...)
-		presContextItem = append(presContextItem, ctx.ID, ctx.Result, 0x00, 0x00)
+		// PS3.8 Table 9-18: context ID, reserved, Result/Reason, reserved.
+		presContextItem = append(presContextItem, ctx.ID, 0x00, ctx.Result, 0x00)
 		presContextItem = append(presContextItem, presContextData...)
 
 		allPresContextItems = append(allPresContextItems, presContextItem...)
@@ -579,7 +583,11 @@ func (p *Layer) createAssociateAccept() []byte {
 	// User Information Item
 	maxPDUItem := []byte{0x51, 0x00, 0x00, 0x04}
 	maxPDUValue := make([]byte, 4)
-	binary.BigEndian.PutUint32(maxPDUValue, 16384)
+	announcedMaxPDU := uint32(16384)
+	if p.associationCtx != nil && p.associationCtx.MaxPDULength > 0 {
+		announcedMaxPDU = p.associationCtx.MaxPDULength
+	}
+	binary.BigEndian.PutUint32(maxPDUValue, announcedMaxPDU)
 	maxPDUItem = append(maxPDUItem, maxPDUValue...)
 
 	implClassUID := "1.2.3.4.5.6.7.8.9"
@@ -696,7 +704,7 @@ func (p *Layer) parseAssociationRequest(pdu *PDU) error {
 			}
 		case 0x50: // User Information
 			p.logger.Debug("Found user information item")
-			if maxPDULength, err := parseUserInformation(itemData); err != nil {
+			if maxPDULength, err := ParseUserInformation(itemData); err != nil {
 				p.logger.Warn("Failed to parse user information", "error", err)
 			} else if maxPDULength > 0 && p.associationCtx != nil {
 				p.associationCtx.MaxPDULength = maxPDULength

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-09-10
+
+### Fixed
+- **Client A-ASSOCIATE-AC parser now detects rejected presentation contexts.**
+  `receiveAssociateAC()` read the Result/Reason from the wrong byte (offset+7, a
+  reserved byte that is always 0x00) instead of offset+6 per PS3.8 Table 9-18, so
+  every context was marked `Accepted`. The SCU could then send C-STORE data on a
+  presentation context / transfer syntax the SCP had rejected, causing the peer
+  to abort mid-transfer ("connection reset by peer"). Rejected contexts are now
+  left `Accepted = false` with an empty `TransferSyntax`, and each is logged at
+  WARN with its context id, abstract syntax, and numeric reason code.
+- **Client now honors the SCP's Maximum PDU Length from the A-ASSOCIATE-AC.**
+  The AC item loop ignored the User Information item (0x50) / Maximum Length
+  sub-item (0x51), so `maxPDULength` stayed at the configured default (16384)
+  regardless of what the SCP announced. P-DATA-TF chunking then produced oversized
+  PDUs that a smaller-max SCP would reset on. The client now parses 0x50/0x51 and
+  sets `maxPDULength = min(configured, peer)`, treating a peer value of 0 as
+  "unlimited" (keeps the configured value).
+- **A-ASSOCIATE-AC writer wire format corrected.** `createAssociateAccept()` put
+  the Result/Reason byte at sub-field offset 1 (reserved) instead of offset 2.
+  Now emitted as `context ID, 0x00, Result, 0x00` per PS3.8, keeping
+  dicomnet<->dicomnet interop while conforming to the standard.
+- **A-ASSOCIATE-AC writer no longer hardcodes the Maximum PDU Length**; it uses
+  the association's negotiated `MaxPDULength`.
+
+### Changed
+- `pdu.parseUserInformation` is now exported as `pdu.ParseUserInformation`.
+
+### Testing
+- Table tests for `receiveAssociateAC` covering all-accepted, mixed
+  accepted/rejected (reasons 3 and 4), and Maximum Length negotiation
+  (smaller / unlimited / larger peer values).
+- Round-trip test: the client builds an A-ASSOCIATE-RQ, the server negotiates and
+  writes the A-ASSOCIATE-AC via its real writer, and the client parses it back —
+  guarding the writer and parser against drifting apart.
+- `pdu` wire-format test asserting the Result byte position and the announced
+  Maximum Length in `createAssociateAccept()`.
+
 ## [0.4.0] - 2025-11-09
 
 ### Added

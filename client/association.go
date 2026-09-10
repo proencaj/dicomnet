@@ -366,8 +366,8 @@ func (a *Association) receiveAssociateAC() error {
 		return fmt.Errorf("failed to read PDU data: %w", err)
 	}
 
-	// Parse presentation context results (simplified)
-	// In production, you'd want to parse all items properly
+	// Parse variable items: presentation context results (0x21) and the
+	// User Information item (0x50).
 	offset := 68 // Skip fixed fields and app context
 	for offset+4 <= len(data) {
 		itemType := data[offset]
@@ -377,42 +377,19 @@ func (a *Association) receiveAssociateAC() error {
 			break
 		}
 
-		if itemType == 0x21 { // Presentation Context Result
-			contextID := data[offset+4]
-			result := byte(0xff)
-			if itemLength >= 4 {
-				result = data[offset+7]
-			}
-
-			transferSyntax := ""
-			subOffset := offset + 8
-			for subOffset+4 <= itemEnd {
-				subItemType := data[subOffset]
-				subItemLength := binary.BigEndian.Uint16(data[subOffset+2 : subOffset+4])
-				subItemEnd := subOffset + 4 + int(subItemLength)
-				if subItemEnd > itemEnd {
-					break
-				}
-
-				if subItemType == 0x40 && subItemLength > 0 {
-					tsVal := string(data[subOffset+4 : subItemEnd])
-					transferSyntax = strings.TrimRight(tsVal, "\x00 ")
-				}
-
-				subOffset = subItemEnd
-			}
-
-			if pc, ok := a.presentationCtxs[contextID]; ok {
-				pc.Accepted = (result == 0)
-				if pc.Accepted && transferSyntax != "" {
-					pc.TransferSyntax = transferSyntax
-				}
-				a.logger.Debug("Presentation context negotiation",
-					"context_id", contextID,
-					"abstract_syntax", pc.AbstractSyntax,
-					"result", result,
-					"accepted", pc.Accepted,
-					"transfer_syntax", pc.TransferSyntax)
+		switch itemType {
+		case 0x21: // Presentation Context Item (A-ASSOCIATE-AC)
+			a.parseACPresentationContext(data, offset, itemLength, itemEnd)
+		case 0x50: // User Information Item
+			peerMax, err := pdu.ParseUserInformation(data[offset+4 : itemEnd])
+			if err != nil {
+				a.logger.Warn("Failed to parse user information from A-ASSOCIATE-AC", "error", err)
+			} else if peerMax > 0 && peerMax < a.maxPDULength {
+				// peerMax == 0 means "unlimited" -> keep configured value.
+				a.logger.Debug("Reducing max PDU length to peer's announced value",
+					"configured", a.maxPDULength,
+					"peer", peerMax)
+				a.maxPDULength = peerMax
 			}
 		}
 
@@ -420,6 +397,65 @@ func (a *Association) receiveAssociateAC() error {
 	}
 
 	return nil
+}
+
+// parseACPresentationContext parses a single 0x21 Presentation Context Item from
+// an A-ASSOCIATE-AC PDU and updates the matching proposed context.
+//
+// Per DICOM PS3.8 Table 9-18, the bytes after the 4-byte item header are:
+// byte0 = presentation context ID, byte1 = reserved, byte2 = Result/Reason,
+// byte3 = reserved, followed by a Transfer Syntax sub-item.
+func (a *Association) parseACPresentationContext(data []byte, offset int, itemLength uint16, itemEnd int) {
+	contextID := data[offset+4]
+	result := byte(0xff)
+	if itemLength >= 4 {
+		result = data[offset+6]
+	}
+	accepted := result == 0
+
+	transferSyntax := ""
+	subOffset := offset + 8
+	for subOffset+4 <= itemEnd {
+		subItemType := data[subOffset]
+		subItemLength := binary.BigEndian.Uint16(data[subOffset+2 : subOffset+4])
+		subItemEnd := subOffset + 4 + int(subItemLength)
+		if subItemEnd > itemEnd {
+			break
+		}
+
+		if subItemType == 0x40 && subItemLength > 0 {
+			tsVal := string(data[subOffset+4 : subItemEnd])
+			transferSyntax = strings.TrimRight(tsVal, "\x00 ")
+		}
+
+		subOffset = subItemEnd
+	}
+
+	pc, ok := a.presentationCtxs[contextID]
+	if !ok {
+		return
+	}
+
+	pc.Accepted = accepted
+	if accepted {
+		if transferSyntax != "" {
+			pc.TransferSyntax = transferSyntax
+		}
+		a.logger.Debug("Presentation context accepted",
+			"context_id", contextID,
+			"abstract_syntax", pc.AbstractSyntax,
+			"transfer_syntax", pc.TransferSyntax)
+		return
+	}
+
+	// Rejected contexts: a rejected AC context may still carry a meaningless
+	// transfer syntax sub-item — ignore it and leave TransferSyntax empty so
+	// the SCU never sends data on a context the SCP did not accept.
+	pc.TransferSyntax = ""
+	a.logger.Warn("Presentation context rejected by SCP",
+		"context_id", contextID,
+		"abstract_syntax", pc.AbstractSyntax,
+		"reason", result)
 }
 
 // sendReleaseRQ sends an A-RELEASE-RQ PDU
