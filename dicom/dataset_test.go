@@ -277,6 +277,137 @@ func TestParseDataset(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Regression test: GE Secondary Capture instances carry an
+			// undefined-length Procedure Code Sequence (0008,1032) before
+			// group 0020. Undefined length used to make the parser break
+			// out of the loop entirely, silently dropping StudyInstanceUID.
+			name: "Undefined-length SQ before StudyInstanceUID",
+			data: func() []byte {
+				var data []byte
+
+				// (0008,1032) Procedure Code Sequence, VR=SQ, undefined length
+				sq := make([]byte, 12)
+				binary.LittleEndian.PutUint16(sq[0:2], 0x0008)
+				binary.LittleEndian.PutUint16(sq[2:4], 0x1032)
+				sq[4] = 'S'
+				sq[5] = 'Q'
+				// sq[6:8] reserved
+				binary.LittleEndian.PutUint32(sq[8:12], undefinedLength)
+				data = append(data, sq...)
+
+				// One Item, defined length, arbitrary payload
+				itemPayload := []byte("PLACEHOLDER!") // 12 bytes, even
+				item := make([]byte, 8)
+				binary.LittleEndian.PutUint16(item[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(item[2:4], 0xE000)
+				binary.LittleEndian.PutUint32(item[4:8], uint32(len(itemPayload)))
+				data = append(data, item...)
+				data = append(data, itemPayload...)
+
+				// Sequence Delimitation Item, length 0
+				seqDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(seqDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(seqDelim[2:4], 0xE0DD)
+				binary.LittleEndian.PutUint32(seqDelim[4:8], 0)
+				data = append(data, seqDelim...)
+
+				// (0020,000D) Study Instance UID, VR=UI, short form
+				uid := []byte("1.2.840.113619.2.1.0")
+				if len(uid)%2 == 1 {
+					uid = append(uid, 0x00)
+				}
+				study := make([]byte, 8)
+				binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+				binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+				study[4] = 'U'
+				study[5] = 'I'
+				binary.LittleEndian.PutUint16(study[6:8], uint16(len(uid)))
+				data = append(data, study...)
+				data = append(data, uid...)
+
+				return data
+			}(),
+			expectedLen: 2,
+			checks: func(t *testing.T, ds *Dataset) {
+				uid := ds.GetString(Tag{0x0020, 0x000D})
+				if uid != "1.2.840.113619.2.1.0" {
+					t.Errorf("Expected StudyInstanceUID 1.2.840.113619.2.1.0, got %q", uid)
+				}
+			},
+		},
+		{
+			// Nested undefined length: the item inside the sequence also has
+			// undefined length, ended by an Item Delimitation Item, exercising
+			// skipItemStream's recursive branch.
+			name: "Nested undefined-length item inside undefined-length SQ",
+			data: func() []byte {
+				var data []byte
+
+				sq := make([]byte, 12)
+				binary.LittleEndian.PutUint16(sq[0:2], 0x0008)
+				binary.LittleEndian.PutUint16(sq[2:4], 0x1032)
+				sq[4] = 'S'
+				sq[5] = 'Q'
+				binary.LittleEndian.PutUint32(sq[8:12], undefinedLength)
+				data = append(data, sq...)
+
+				// Item with undefined length
+				item := make([]byte, 8)
+				binary.LittleEndian.PutUint16(item[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(item[2:4], 0xE000)
+				binary.LittleEndian.PutUint32(item[4:8], undefinedLength)
+				data = append(data, item...)
+
+				// A short element inside the item (0008,0100) Code Value, VR=SH
+				code := []byte("AB")
+				inner := make([]byte, 8)
+				binary.LittleEndian.PutUint16(inner[0:2], 0x0008)
+				binary.LittleEndian.PutUint16(inner[2:4], 0x0100)
+				inner[4] = 'S'
+				inner[5] = 'H'
+				binary.LittleEndian.PutUint16(inner[6:8], uint16(len(code)))
+				data = append(data, inner...)
+				data = append(data, code...)
+
+				// Item Delimitation Item, length 0
+				itemDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(itemDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(itemDelim[2:4], 0xE00D)
+				binary.LittleEndian.PutUint32(itemDelim[4:8], 0)
+				data = append(data, itemDelim...)
+
+				// Sequence Delimitation Item, length 0
+				seqDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(seqDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(seqDelim[2:4], 0xE0DD)
+				binary.LittleEndian.PutUint32(seqDelim[4:8], 0)
+				data = append(data, seqDelim...)
+
+				// (0020,000D) Study Instance UID
+				uid := []byte("1.2.3.4.5.6")
+				if len(uid)%2 == 1 {
+					uid = append(uid, 0x00)
+				}
+				study := make([]byte, 8)
+				binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+				binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+				study[4] = 'U'
+				study[5] = 'I'
+				binary.LittleEndian.PutUint16(study[6:8], uint16(len(uid)))
+				data = append(data, study...)
+				data = append(data, uid...)
+
+				return data
+			}(),
+			expectedLen: 2,
+			checks: func(t *testing.T, ds *Dataset) {
+				uid := ds.GetString(Tag{0x0020, 0x000D})
+				if uid != "1.2.3.4.5.6" {
+					t.Errorf("Expected StudyInstanceUID 1.2.3.4.5.6, got %q", uid)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -294,6 +425,65 @@ func TestParseDataset(t *testing.T) {
 				tt.checks(t, ds)
 			}
 		})
+	}
+}
+
+func TestParseImplicitVRDataset(t *testing.T) {
+	// Same regression scenario as TestParseDataset's undefined-length SQ
+	// cases, but encoded as Implicit VR Little Endian: no VR field, every
+	// element header is tag(4)+length(4). Item/delimiter tags are unaffected
+	// by transfer syntax, so the same skipUndefinedLength walk applies.
+	data := func() []byte {
+		var data []byte
+
+		// (0008,1032) Procedure Code Sequence, implicit VR, undefined length
+		sq := make([]byte, 8)
+		binary.LittleEndian.PutUint16(sq[0:2], 0x0008)
+		binary.LittleEndian.PutUint16(sq[2:4], 0x1032)
+		binary.LittleEndian.PutUint32(sq[4:8], undefinedLength)
+		data = append(data, sq...)
+
+		itemPayload := []byte("PLACEHOLDER!")
+		item := make([]byte, 8)
+		binary.LittleEndian.PutUint16(item[0:2], 0xFFFE)
+		binary.LittleEndian.PutUint16(item[2:4], 0xE000)
+		binary.LittleEndian.PutUint32(item[4:8], uint32(len(itemPayload)))
+		data = append(data, item...)
+		data = append(data, itemPayload...)
+
+		seqDelim := make([]byte, 8)
+		binary.LittleEndian.PutUint16(seqDelim[0:2], 0xFFFE)
+		binary.LittleEndian.PutUint16(seqDelim[2:4], 0xE0DD)
+		binary.LittleEndian.PutUint32(seqDelim[4:8], 0)
+		data = append(data, seqDelim...)
+
+		// (0020,000D) Study Instance UID, implicit VR
+		uid := []byte("1.2.840.113619.9.9.9")
+		if len(uid)%2 == 1 {
+			uid = append(uid, 0x00)
+		}
+		study := make([]byte, 8)
+		binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+		binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+		binary.LittleEndian.PutUint32(study[4:8], uint32(len(uid)))
+		data = append(data, study...)
+		data = append(data, uid...)
+
+		return data
+	}()
+
+	ds, err := ParseDatasetWithTransferSyntax(data, TransferSyntaxImplicitVRLittleEndian)
+	if err != nil {
+		t.Fatalf("ParseDatasetWithTransferSyntax failed: %v", err)
+	}
+
+	if len(ds.Elements) != 2 {
+		t.Errorf("Expected 2 elements, got %d", len(ds.Elements))
+	}
+
+	uid := ds.GetString(Tag{0x0020, 0x000D})
+	if uid != "1.2.840.113619.9.9.9" {
+		t.Errorf("Expected StudyInstanceUID 1.2.840.113619.9.9.9, got %q", uid)
 	}
 }
 
