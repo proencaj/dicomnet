@@ -484,6 +484,115 @@ func TestParseDataset(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Regression test: the top-level VR=UN override lived only in
+			// ParseDataset. A VR=UN element with undefined length nested
+			// *inside* a sequence item is walked by skipItemStream instead,
+			// which used to ignore the nested element's own VR and always
+			// inherit the outer explicitVR, corrupting/truncating the rest
+			// of the dataset for exactly the same reason as the top-level case.
+			name: "Nested undefined-length UN inside a sequence item parses as Implicit VR",
+			data: func() []byte {
+				var data []byte
+
+				// (0008,1032) Procedure Code Sequence, VR=SQ, undefined length
+				sq := make([]byte, 12)
+				binary.LittleEndian.PutUint16(sq[0:2], 0x0008)
+				binary.LittleEndian.PutUint16(sq[2:4], 0x1032)
+				sq[4] = 'S'
+				sq[5] = 'Q'
+				binary.LittleEndian.PutUint32(sq[8:12], undefinedLength)
+				data = append(data, sq...)
+
+				// Outer Item, undefined length (its stream ends at an Item
+				// Delimitation Item)
+				outerItem := make([]byte, 8)
+				binary.LittleEndian.PutUint16(outerItem[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(outerItem[2:4], 0xE000)
+				binary.LittleEndian.PutUint32(outerItem[4:8], undefinedLength)
+				data = append(data, outerItem...)
+
+				// (0009,0010) Private tag, VR=UN, undefined length, nested
+				// inside the outer item
+				un := make([]byte, 12)
+				binary.LittleEndian.PutUint16(un[0:2], 0x0009)
+				binary.LittleEndian.PutUint16(un[2:4], 0x0010)
+				un[4] = 'U'
+				un[5] = 'N'
+				binary.LittleEndian.PutUint32(un[8:12], undefinedLength)
+				data = append(data, un...)
+
+				// UN's own content: an Item with undefined length, whose
+				// stream is Implicit-VR framed (tag(4)+length(4), no VR
+				// bytes), same "low bytes don't form a recognized VR code"
+				// construction as the top-level regression case.
+				innerItem := make([]byte, 8)
+				binary.LittleEndian.PutUint16(innerItem[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(innerItem[2:4], 0xE000)
+				binary.LittleEndian.PutUint32(innerItem[4:8], undefinedLength)
+				data = append(data, innerItem...)
+
+				// Nested element, Implicit VR framing: tag(4) + length(4) + payload.
+				// Tag (0009,0001), length 4, payload "WXYZ".
+				nested := make([]byte, 8)
+				binary.LittleEndian.PutUint16(nested[0:2], 0x0009)
+				binary.LittleEndian.PutUint16(nested[2:4], 0x0001)
+				binary.LittleEndian.PutUint32(nested[4:8], 4)
+				data = append(data, nested...)
+				data = append(data, []byte("WXYZ")...)
+
+				// Item Delimitation Item, ends the inner item's stream
+				innerItemDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(innerItemDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(innerItemDelim[2:4], 0xE00D)
+				binary.LittleEndian.PutUint32(innerItemDelim[4:8], 0)
+				data = append(data, innerItemDelim...)
+
+				// Sequence Delimitation Item, ends the UN element's own scan
+				unSeqDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(unSeqDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(unSeqDelim[2:4], 0xE0DD)
+				binary.LittleEndian.PutUint32(unSeqDelim[4:8], 0)
+				data = append(data, unSeqDelim...)
+
+				// Item Delimitation Item, ends the outer item's stream
+				outerItemDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(outerItemDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(outerItemDelim[2:4], 0xE00D)
+				binary.LittleEndian.PutUint32(outerItemDelim[4:8], 0)
+				data = append(data, outerItemDelim...)
+
+				// Sequence Delimitation Item, ends the outer SQ's scan
+				sqSeqDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(sqSeqDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(sqSeqDelim[2:4], 0xE0DD)
+				binary.LittleEndian.PutUint32(sqSeqDelim[4:8], 0)
+				data = append(data, sqSeqDelim...)
+
+				// (0020,000D) Study Instance UID, VR=UI, short form
+				uid := []byte("1.2.9.9.9.9.9")
+				if len(uid)%2 == 1 {
+					uid = append(uid, 0x00)
+				}
+				study := make([]byte, 8)
+				binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+				binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+				study[4] = 'U'
+				study[5] = 'I'
+				binary.LittleEndian.PutUint16(study[6:8], uint16(len(uid)))
+				data = append(data, study...)
+				data = append(data, uid...)
+
+				return data
+			}(),
+			expectedLen: 2,
+			checks: func(t *testing.T, ds *Dataset) {
+				uid := ds.GetString(Tag{0x0020, 0x000D})
+				if uid != "1.2.9.9.9.9.9" {
+					t.Errorf("Expected StudyInstanceUID 1.2.9.9.9.9.9, got %q", uid)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

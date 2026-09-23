@@ -145,6 +145,18 @@ var (
 	sequenceDelimitationTag = Tag{0xFFFE, 0xE0DD}
 )
 
+// isLongFormVR reports whether vr uses the long (4-byte length, 2 reserved
+// bytes) Explicit VR element header form rather than the short (2-byte
+// length) form.
+func isLongFormVR(vr string) bool {
+	switch vr {
+	case VR_OB, VR_OD, VR_OF, VR_OL, VR_OW, VR_SQ, VR_UC, VR_UR, VR_UT, VR_UN, VR_OV, VR_SV, VR_UV:
+		return true
+	default:
+		return false
+	}
+}
+
 // skipUndefinedLength resolves the end offset of an undefined-length element
 // (e.g. an SQ or encapsulated OB/OW) by walking its Item (FFFE,E000) and
 // Sequence Delimitation Item (FFFE,E0DD) tags, per the DICOM standard's rule
@@ -207,16 +219,14 @@ func skipItemStream(data []byte, offset int, explicitVR bool) (int, error) {
 
 		var length uint32
 		var nextOffset int
+		var vr string
 
 		if explicitVR {
 			if offset+6 > len(data) {
 				return 0, fmt.Errorf("truncated element header at offset %d", offset)
 			}
-			vr := string(data[offset+4 : offset+6])
-			isLongVR := vr == "OB" || vr == "OD" || vr == "OF" || vr == "OL" || vr == "OW" ||
-				vr == "SQ" || vr == "UC" || vr == "UR" || vr == "UT" || vr == "UN" ||
-				vr == "OV" || vr == "SV" || vr == "UV"
-			if isLongVR {
+			vr = string(data[offset+4 : offset+6])
+			if isLongFormVR(vr) {
 				if offset+12 > len(data) {
 					return 0, fmt.Errorf("truncated long-VR element header at offset %d", offset)
 				}
@@ -235,8 +245,12 @@ func skipItemStream(data []byte, offset int, explicitVR bool) (int, error) {
 		}
 
 		if length == undefinedLength {
+			// Per PS3.5, a nested VR=UN element with undefined length must
+			// have its own content walked as Implicit VR, same as the
+			// top-level case in ParseDataset.
+			nestedExplicitVR := explicitVR && vr != VR_UN
 			var err error
-			nextOffset, err = skipUndefinedLength(data, nextOffset, explicitVR)
+			nextOffset, err = skipUndefinedLength(data, nextOffset, nestedExplicitVR)
 			if err != nil {
 				return 0, err
 			}
@@ -283,11 +297,7 @@ func ParseDataset(data []byte) (*Dataset, error) {
 		// Determine if this is a short or long VR
 		// Short VRs: AE, AS, AT, CS, DA, DS, DT, FL, FD, IS, LO, LT, PN, SH, SL, SS, ST, TM, UI, UL, US
 		// Long VRs: OB, OD, OF, OL, OW, SQ, UC, UR, UT, UN, OV, SV, UV
-		isLongVR := vr == "OB" || vr == "OD" || vr == "OF" || vr == "OL" || vr == "OW" ||
-			vr == "SQ" || vr == "UC" || vr == "UR" || vr == "UT" || vr == "UN" ||
-			vr == "OV" || vr == "SV" || vr == "UV"
-
-		if isLongVR {
+		if isLongFormVR(vr) {
 			// Long VR: Tag (4) + VR (2) + Reserved (2) + Length (4) = 12 bytes header
 			if offset+12 > len(data) {
 				break
