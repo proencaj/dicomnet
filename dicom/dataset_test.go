@@ -408,6 +408,82 @@ func TestParseDataset(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Regression test: per PS3.5, a VR=UN element with undefined
+			// length must have its nested content walked as Implicit VR
+			// Little Endian even inside an Explicit VR dataset, since the
+			// true VR was unknown to the sender. The nested element here has
+			// an implicit-VR length (4) whose low bytes don't form a
+			// recognized VR code, so misreading it as Explicit VR desyncs
+			// the offset and corrupts/drops the trailing StudyInstanceUID.
+			name: "Undefined-length UN parses nested content as Implicit VR",
+			data: func() []byte {
+				var data []byte
+
+				// (0009,0010) Private tag, VR=UN, undefined length
+				un := make([]byte, 12)
+				binary.LittleEndian.PutUint16(un[0:2], 0x0009)
+				binary.LittleEndian.PutUint16(un[2:4], 0x0010)
+				un[4] = 'U'
+				un[5] = 'N'
+				binary.LittleEndian.PutUint32(un[8:12], undefinedLength)
+				data = append(data, un...)
+
+				// Item with undefined length (content is an implicit-VR
+				// element stream terminated by an Item Delimitation Item)
+				item := make([]byte, 8)
+				binary.LittleEndian.PutUint16(item[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(item[2:4], 0xE000)
+				binary.LittleEndian.PutUint32(item[4:8], undefinedLength)
+				data = append(data, item...)
+
+				// Nested element, Implicit VR framing: tag(4) + length(4) + payload.
+				// Tag (0009,0001), length 4, payload "WXYZ".
+				nested := make([]byte, 8)
+				binary.LittleEndian.PutUint16(nested[0:2], 0x0009)
+				binary.LittleEndian.PutUint16(nested[2:4], 0x0001)
+				binary.LittleEndian.PutUint32(nested[4:8], 4)
+				data = append(data, nested...)
+				data = append(data, []byte("WXYZ")...)
+
+				// Item Delimitation Item, length 0
+				itemDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(itemDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(itemDelim[2:4], 0xE00D)
+				binary.LittleEndian.PutUint32(itemDelim[4:8], 0)
+				data = append(data, itemDelim...)
+
+				// Sequence Delimitation Item, length 0
+				seqDelim := make([]byte, 8)
+				binary.LittleEndian.PutUint16(seqDelim[0:2], 0xFFFE)
+				binary.LittleEndian.PutUint16(seqDelim[2:4], 0xE0DD)
+				binary.LittleEndian.PutUint32(seqDelim[4:8], 0)
+				data = append(data, seqDelim...)
+
+				// (0020,000D) Study Instance UID, VR=UI, short form
+				uid := []byte("1.9.8.7.6.5.4")
+				if len(uid)%2 == 1 {
+					uid = append(uid, 0x00)
+				}
+				study := make([]byte, 8)
+				binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+				binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+				study[4] = 'U'
+				study[5] = 'I'
+				binary.LittleEndian.PutUint16(study[6:8], uint16(len(uid)))
+				data = append(data, study...)
+				data = append(data, uid...)
+
+				return data
+			}(),
+			expectedLen: 2,
+			checks: func(t *testing.T, ds *Dataset) {
+				uid := ds.GetString(Tag{0x0020, 0x000D})
+				if uid != "1.9.8.7.6.5.4" {
+					t.Errorf("Expected StudyInstanceUID 1.9.8.7.6.5.4, got %q", uid)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -626,6 +702,144 @@ func TestDataset_RoundTrip(t *testing.T) {
 		if value != tt.expected {
 			t.Errorf("Tag %v: expected %q, got %q", tt.tag, tt.expected, value)
 		}
+	}
+}
+
+// TestDataset_RoundTrip_UndefinedLength is a regression test: re-encoding a
+// parsed undefined-length element used to write a defined length computed
+// from the captured byte count, even though those bytes still contain
+// embedded Item/Sequence-Delimitation tag headers. That produces invalid
+// DICOM. The length field must round-trip as 0xFFFFFFFF.
+func TestDataset_RoundTrip_UndefinedLength(t *testing.T) {
+	original := func() []byte {
+		var data []byte
+
+		// (0008,1032) Procedure Code Sequence, VR=SQ, undefined length
+		sq := make([]byte, 12)
+		binary.LittleEndian.PutUint16(sq[0:2], 0x0008)
+		binary.LittleEndian.PutUint16(sq[2:4], 0x1032)
+		sq[4] = 'S'
+		sq[5] = 'Q'
+		binary.LittleEndian.PutUint32(sq[8:12], undefinedLength)
+		data = append(data, sq...)
+
+		itemPayload := []byte("PLACEHOLDER!")
+		item := make([]byte, 8)
+		binary.LittleEndian.PutUint16(item[0:2], 0xFFFE)
+		binary.LittleEndian.PutUint16(item[2:4], 0xE000)
+		binary.LittleEndian.PutUint32(item[4:8], uint32(len(itemPayload)))
+		data = append(data, item...)
+		data = append(data, itemPayload...)
+
+		seqDelim := make([]byte, 8)
+		binary.LittleEndian.PutUint16(seqDelim[0:2], 0xFFFE)
+		binary.LittleEndian.PutUint16(seqDelim[2:4], 0xE0DD)
+		binary.LittleEndian.PutUint32(seqDelim[4:8], 0)
+		data = append(data, seqDelim...)
+
+		uid := []byte("1.2.840.113619.2.1.0")
+		if len(uid)%2 == 1 {
+			uid = append(uid, 0x00)
+		}
+		study := make([]byte, 8)
+		binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+		binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+		study[4] = 'U'
+		study[5] = 'I'
+		binary.LittleEndian.PutUint16(study[6:8], uint16(len(uid)))
+		data = append(data, study...)
+		data = append(data, uid...)
+
+		return data
+	}()
+
+	parsed, err := ParseDataset(original)
+	if err != nil {
+		t.Fatalf("ParseDataset failed: %v", err)
+	}
+
+	encoded := parsed.EncodeDataset()
+
+	// The SQ element sorts first (group 0008 < 0020), so its 12-byte
+	// long-VR header starts at offset 0: tag(4) + VR(2) + reserved(2) + length(4).
+	length := binary.LittleEndian.Uint32(encoded[8:12])
+	if length != undefinedLength {
+		t.Errorf("Expected re-encoded length to be 0xFFFFFFFF, got 0x%X", length)
+	}
+
+	reparsed, err := ParseDataset(encoded)
+	if err != nil {
+		t.Fatalf("Re-parsing re-encoded dataset failed: %v", err)
+	}
+	uid := reparsed.GetString(Tag{0x0020, 0x000D})
+	if uid != "1.2.840.113619.2.1.0" {
+		t.Errorf("Expected StudyInstanceUID 1.2.840.113619.2.1.0 after round-trip, got %q", uid)
+	}
+}
+
+// TestDataset_RoundTrip_UndefinedLength_ImplicitVR mirrors
+// TestDataset_RoundTrip_UndefinedLength for the Implicit VR encode/parse path.
+func TestDataset_RoundTrip_UndefinedLength_ImplicitVR(t *testing.T) {
+	original := func() []byte {
+		var data []byte
+
+		sq := make([]byte, 8)
+		binary.LittleEndian.PutUint16(sq[0:2], 0x0008)
+		binary.LittleEndian.PutUint16(sq[2:4], 0x1032)
+		binary.LittleEndian.PutUint32(sq[4:8], undefinedLength)
+		data = append(data, sq...)
+
+		itemPayload := []byte("PLACEHOLDER!")
+		item := make([]byte, 8)
+		binary.LittleEndian.PutUint16(item[0:2], 0xFFFE)
+		binary.LittleEndian.PutUint16(item[2:4], 0xE000)
+		binary.LittleEndian.PutUint32(item[4:8], uint32(len(itemPayload)))
+		data = append(data, item...)
+		data = append(data, itemPayload...)
+
+		seqDelim := make([]byte, 8)
+		binary.LittleEndian.PutUint16(seqDelim[0:2], 0xFFFE)
+		binary.LittleEndian.PutUint16(seqDelim[2:4], 0xE0DD)
+		binary.LittleEndian.PutUint32(seqDelim[4:8], 0)
+		data = append(data, seqDelim...)
+
+		uid := []byte("1.2.840.113619.9.9.9")
+		if len(uid)%2 == 1 {
+			uid = append(uid, 0x00)
+		}
+		study := make([]byte, 8)
+		binary.LittleEndian.PutUint16(study[0:2], 0x0020)
+		binary.LittleEndian.PutUint16(study[2:4], 0x000D)
+		binary.LittleEndian.PutUint32(study[4:8], uint32(len(uid)))
+		data = append(data, study...)
+		data = append(data, uid...)
+
+		return data
+	}()
+
+	parsed, err := ParseDatasetWithTransferSyntax(original, TransferSyntaxImplicitVRLittleEndian)
+	if err != nil {
+		t.Fatalf("ParseDatasetWithTransferSyntax failed: %v", err)
+	}
+
+	encoded, err := EncodeDatasetWithTransferSyntax(parsed, TransferSyntaxImplicitVRLittleEndian)
+	if err != nil {
+		t.Fatalf("EncodeDatasetWithTransferSyntax failed: %v", err)
+	}
+
+	// Implicit VR header: tag(4) + length(4). SQ tag sorts first.
+	length := binary.LittleEndian.Uint32(encoded[4:8])
+	if length != undefinedLength {
+		t.Errorf("Expected re-encoded length to be 0xFFFFFFFF, got 0x%X", length)
+	}
+
+	reparsed, err := ParseDatasetWithTransferSyntax(encoded, TransferSyntaxImplicitVRLittleEndian)
+	if err != nil {
+		t.Fatalf("Re-parsing re-encoded dataset failed: %v", err)
+	}
+	uid := reparsed.GetString(Tag{0x0020, 0x000D})
+	if uid != "1.2.840.113619.9.9.9" {
+		t.Errorf("Expected StudyInstanceUID 1.2.840.113619.9.9.9 after round-trip, got %q", uid)
 	}
 }
 
