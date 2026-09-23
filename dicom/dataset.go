@@ -99,7 +99,10 @@ func (d *Dataset) GetElement(tag Tag) (*Element, bool) {
 	return element, exists
 }
 
-// GetString returns a string value for a tag
+// GetString returns a string value for a tag. Returns "" if the tag is
+// absent or its value is not a string (e.g. a raw []byte captured from an
+// undefined-length SQ/OB/OW/UN element) -- use GetElement to distinguish
+// "absent" from "present but non-string".
 func (d *Dataset) GetString(tag Tag) string {
 	if element, exists := d.Elements[tag]; exists {
 		if str, ok := element.Value.(string); ok {
@@ -109,7 +112,10 @@ func (d *Dataset) GetString(tag Tag) string {
 	return ""
 }
 
-// GetStrings returns a slice of string values for a tag
+// GetStrings returns a slice of string values for a tag. Returns nil if the
+// tag is absent or its value is not a string/[]string (e.g. a raw []byte
+// captured from an undefined-length SQ/OB/OW/UN element) -- use GetElement
+// to distinguish "absent" from "present but non-string".
 func (d *Dataset) GetStrings(tag Tag) []string {
 	if element, exists := d.Elements[tag]; exists {
 		switch v := element.Value.(type) {
@@ -126,6 +132,140 @@ func (d *Dataset) GetStrings(tag Tag) []string {
 		}
 	}
 	return nil
+}
+
+// undefinedLength is the sentinel value (0xFFFFFFFF) marking a sequence or
+// encapsulated pixel data element whose true length is determined by walking
+// Item/Delimiter tags rather than reading a byte count.
+const undefinedLength = 0xFFFFFFFF
+
+var (
+	itemTag                 = Tag{0xFFFE, 0xE000}
+	itemDelimitationTag     = Tag{0xFFFE, 0xE00D}
+	sequenceDelimitationTag = Tag{0xFFFE, 0xE0DD}
+)
+
+// isLongFormVR reports whether vr uses the long (4-byte length, 2 reserved
+// bytes) Explicit VR element header form rather than the short (2-byte
+// length) form.
+func isLongFormVR(vr string) bool {
+	switch vr {
+	case VR_OB, VR_OD, VR_OF, VR_OL, VR_OW, VR_SQ, VR_UC, VR_UR, VR_UT, VR_UN, VR_OV, VR_SV, VR_UV:
+		return true
+	default:
+		return false
+	}
+}
+
+// skipUndefinedLength resolves the end offset of an undefined-length element
+// (e.g. an SQ or encapsulated OB/OW) by walking its Item (FFFE,E000) and
+// Sequence Delimitation Item (FFFE,E0DD) tags, per the DICOM standard's rule
+// that item/delimiter tags -- not a length field -- bound undefined-length
+// content. Items whose own length is undefined are resolved recursively via
+// the same element-header logic as the enclosing dataset (explicitVR selects
+// short/long VR-form header parsing vs. implicit VR's fixed 8-byte header).
+func skipUndefinedLength(data []byte, offset int, explicitVR bool) (int, error) {
+	for {
+		if offset+8 > len(data) {
+			return 0, fmt.Errorf("truncated data while scanning undefined-length element at offset %d", offset)
+		}
+
+		group := binary.LittleEndian.Uint16(data[offset : offset+2])
+		element := binary.LittleEndian.Uint16(data[offset+2 : offset+4])
+		tag := Tag{Group: group, Element: element}
+		itemLength := binary.LittleEndian.Uint32(data[offset+4 : offset+8])
+		offset += 8
+
+		switch tag {
+		case sequenceDelimitationTag:
+			return offset, nil
+		case itemTag:
+			if itemLength == undefinedLength {
+				var err error
+				offset, err = skipItemStream(data, offset, explicitVR)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				offset += int(itemLength)
+				if offset > len(data) {
+					return 0, fmt.Errorf("item length exceeds available data at offset %d", offset)
+				}
+			}
+		default:
+			return 0, fmt.Errorf("unexpected tag %s while scanning undefined-length element at offset %d", tag, offset-8)
+		}
+	}
+}
+
+// skipItemStream scans a sequence item whose own length is undefined: its
+// content is a stream of ordinary data elements, ending at the Item
+// Delimitation Item (FFFE,E00D). Nested undefined-length elements within the
+// item (e.g. a sequence inside a sequence) are resolved via skipUndefinedLength.
+func skipItemStream(data []byte, offset int, explicitVR bool) (int, error) {
+	for {
+		if offset+8 > len(data) {
+			return 0, fmt.Errorf("truncated data while scanning item stream at offset %d", offset)
+		}
+
+		group := binary.LittleEndian.Uint16(data[offset : offset+2])
+		element := binary.LittleEndian.Uint16(data[offset+2 : offset+4])
+		tag := Tag{Group: group, Element: element}
+
+		if tag == itemDelimitationTag {
+			// Item Delimitation Item: tag (4) + length (4, must be 0)
+			return offset + 8, nil
+		}
+
+		var length uint32
+		var nextOffset int
+		var vr string
+
+		if explicitVR {
+			if offset+6 > len(data) {
+				return 0, fmt.Errorf("truncated element header at offset %d", offset)
+			}
+			vr = string(data[offset+4 : offset+6])
+			if isLongFormVR(vr) {
+				if offset+12 > len(data) {
+					return 0, fmt.Errorf("truncated long-VR element header at offset %d", offset)
+				}
+				length = binary.LittleEndian.Uint32(data[offset+8 : offset+12])
+				nextOffset = offset + 12
+			} else {
+				if offset+8 > len(data) {
+					return 0, fmt.Errorf("truncated short-VR element header at offset %d", offset)
+				}
+				length = uint32(binary.LittleEndian.Uint16(data[offset+6 : offset+8]))
+				nextOffset = offset + 8
+			}
+		} else {
+			length = binary.LittleEndian.Uint32(data[offset+4 : offset+8])
+			nextOffset = offset + 8
+		}
+
+		if length == undefinedLength {
+			// Per PS3.5, a nested VR=UN element with undefined length must
+			// have its own content walked as Implicit VR, same as the
+			// top-level case in ParseDataset.
+			nestedExplicitVR := explicitVR && vr != VR_UN
+			var err error
+			nextOffset, err = skipUndefinedLength(data, nextOffset, nestedExplicitVR)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			nextOffset += int(length)
+			if length%2 == 1 {
+				nextOffset++
+			}
+			if nextOffset > len(data) {
+				return 0, fmt.Errorf("element length exceeds available data at offset %d", offset)
+			}
+		}
+
+		offset = nextOffset
+	}
 }
 
 // ParseDataset parses a DICOM dataset from raw bytes (Explicit VR Little Endian)
@@ -157,11 +297,7 @@ func ParseDataset(data []byte) (*Dataset, error) {
 		// Determine if this is a short or long VR
 		// Short VRs: AE, AS, AT, CS, DA, DS, DT, FL, FD, IS, LO, LT, PN, SH, SL, SS, ST, TM, UI, UL, US
 		// Long VRs: OB, OD, OF, OL, OW, SQ, UC, UR, UT, UN, OV, SV, UV
-		isLongVR := vr == "OB" || vr == "OD" || vr == "OF" || vr == "OL" || vr == "OW" ||
-			vr == "SQ" || vr == "UC" || vr == "UR" || vr == "UT" || vr == "UN" ||
-			vr == "OV" || vr == "SV" || vr == "UV"
-
-		if isLongVR {
+		if isLongFormVR(vr) {
 			// Long VR: Tag (4) + VR (2) + Reserved (2) + Length (4) = 12 bytes header
 			if offset+12 > len(data) {
 				break
@@ -173,6 +309,22 @@ func ParseDataset(data []byte) (*Dataset, error) {
 			// Short VR: Tag (4) + VR (2) + Length (2) = 8 bytes header
 			length = uint32(binary.LittleEndian.Uint16(data[offset+6 : offset+8]))
 			valueOffset = offset + 8
+		}
+
+		if length == undefinedLength {
+			// Per PS3.5, an element with VR=UN and undefined length must have
+			// its nested content parsed as Implicit VR Little Endian
+			// regardless of the outer transfer syntax, since the true VR was
+			// unknown to the sender.
+			explicitVR := vr != VR_UN
+			nextOffset, err := skipUndefinedLength(data, valueOffset, explicitVR)
+			if err != nil {
+				break
+			}
+			dataset.AddElement(tag, vr, data[valueOffset:nextOffset])
+			dataset.Elements[tag].Length = undefinedLength
+			offset = nextOffset
+			continue
 		}
 
 		// Ensure we have enough data for the value
@@ -224,6 +376,17 @@ func parseImplicitVRDataset(data []byte) (*Dataset, error) {
 
 		length := binary.LittleEndian.Uint32(data[offset+4 : offset+8])
 		valueOffset := offset + 8
+
+		if length == undefinedLength {
+			nextOffset, err := skipUndefinedLength(data, valueOffset, false)
+			if err != nil {
+				break
+			}
+			dataset.AddElement(tag, determineVR(tag), data[valueOffset:nextOffset])
+			dataset.Elements[tag].Length = undefinedLength
+			offset = nextOffset
+			continue
+		}
 
 		if valueOffset+int(length) > len(data) {
 			break
@@ -364,8 +527,13 @@ func (d *Dataset) EncodeDataset() []byte {
 		// Encode value
 		valueBytes := encodeElementValue(element)
 
+		// Undefined-length elements (raw captured SQ/encapsulated-pixel-data
+		// spans) are already correctly bounded by their Item/Delimitation
+		// tags; padding or resizing them would corrupt that framing.
+		isUndefinedLength := element.Length == undefinedLength
+
 		// Add padding if odd length (DICOM requires even lengths)
-		if len(valueBytes)%2 == 1 {
+		if !isUndefinedLength && len(valueBytes)%2 == 1 {
 			valueBytes = append(valueBytes, 0x20) // Use space padding for text elements
 		}
 
@@ -381,7 +549,11 @@ func (d *Dataset) EncodeDataset() []byte {
 			// Long VR format: VR (2 bytes) + Reserved (2 bytes) + Length (4 bytes)
 			result = append(result, 0x00, 0x00) // Reserved bytes
 			lengthBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(valueBytes)))
+			if isUndefinedLength {
+				binary.LittleEndian.PutUint32(lengthBytes, undefinedLength)
+			} else {
+				binary.LittleEndian.PutUint32(lengthBytes, uint32(len(valueBytes)))
+			}
 			result = append(result, lengthBytes...)
 		} else {
 			// Short VR format: VR (2 bytes) + Length (2 bytes)
@@ -443,12 +615,17 @@ func encodeImplicitVRDataset(dataset *Dataset) []byte {
 		result = append(result, tagBytes...)
 
 		valueBytes := encodeElementValue(element)
-		if len(valueBytes)%2 == 1 {
+		isUndefinedLength := element.Length == undefinedLength
+		if !isUndefinedLength && len(valueBytes)%2 == 1 {
 			valueBytes = append(valueBytes, 0x20)
 		}
 
 		lengthBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(lengthBytes, uint32(len(valueBytes)))
+		if isUndefinedLength {
+			binary.LittleEndian.PutUint32(lengthBytes, undefinedLength)
+		} else {
+			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(valueBytes)))
+		}
 		result = append(result, lengthBytes...)
 		result = append(result, valueBytes...)
 	}
@@ -459,6 +636,8 @@ func encodeImplicitVRDataset(dataset *Dataset) []byte {
 // encodeElementValue encodes an element value to bytes
 func encodeElementValue(element *Element) []byte {
 	switch v := element.Value.(type) {
+	case []byte:
+		return v
 	case string:
 		// For string VRs, ensure proper encoding
 		value := v
